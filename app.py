@@ -1,14 +1,8 @@
 import re
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# --- model deps (LOCAL) ---
-import torch
-import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
 
 # Optional deps for embeddings
 EMBEDDINGS_AVAILABLE = True
@@ -33,13 +27,6 @@ st.set_page_config(
 
 DATA_PATH = Path("data/produits_co2.csv")
 
-# LOCAL MODEL PATHS
-LOCAL_MODEL_DIR = Path("models_local/carbon_qwen")
-LOCAL_ENCODER_DIR = LOCAL_MODEL_DIR / "encoder"
-LOCAL_TOKENIZER_DIR = LOCAL_MODEL_DIR / "tokenizer"
-LOCAL_HEAD_DIR = LOCAL_MODEL_DIR / "head_repo"
-LOCAL_HEAD_WEIGHTS = LOCAL_HEAD_DIR / "best_model.pt"  # ✅ IMPORTANT
-
 # Alternative strictness
 SIM_THRESHOLD = 0.80
 MIN_SHARED_TOKENS = 2
@@ -63,7 +50,6 @@ UNIT_CHOICES = [
     "kgCO2e/k€",
     "À compléter",
 ]
-
 
 # -----------------------------
 # STYLE
@@ -118,7 +104,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 
 
 # -----------------------------
-# HELPERS (text + formatting)
+# HELPERS
 # -----------------------------
 def normalize_text(s: str) -> str:
     s = (s or "").lower().strip()
@@ -142,10 +128,6 @@ def format_kgco2(x: float) -> str:
         return f"{x/1000:.2f} tCO₂e"
     return f"{x:.2f} kgCO₂e"
 
-
-# -----------------------------
-# DATA
-# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_data(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -170,10 +152,6 @@ def load_data(path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["co2"]).reset_index(drop=True)
     return df
 
-
-# -----------------------------
-# EMBEDDINGS (for alternative suggestion)
-# -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_embedder():
     if not EMBEDDINGS_AVAILABLE:
@@ -221,11 +199,10 @@ def similarity_search(df: pd.DataFrame, query: str, top_k: int = 40):
     out["sim"] = sims[idx]
     return out
 
-
-# -----------------------------
-# ALTERNATIVE SUGGESTION
-# -----------------------------
 def normalize_variant(name: str) -> str:
+    """
+    Standardize common variant tokens so we can compare names.
+    """
     n = normalize_text(name)
     n = n.replace("single use", "single-use")
     n = n.replace("singleuse", "single-use")
@@ -233,10 +210,22 @@ def normalize_variant(name: str) -> str:
     return n
 
 def variant_swap_candidate(df: pd.DataFrame, product_name: str, current_factor: float):
+    """
+    Tier-1 rule: try to find a 'same base product' with greener variant.
+    Examples:
+      disposable -> reusable
+      single-use -> reusable
+      virgin -> recycled
+      new -> remanufactured
+    We ONLY accept if:
+      - name after removing variant tokens is very close (token overlap)
+      - CO2 is lower
+    """
     if df.empty:
         return None
 
     src = normalize_variant(product_name)
+
     swaps = [
         ("disposable", "reusable"),
         ("single-use", "reusable"),
@@ -244,6 +233,7 @@ def variant_swap_candidate(df: pd.DataFrame, product_name: str, current_factor: 
         ("new", "remanufactured"),
     ]
 
+    # Remove variant tokens to compare base
     def base_form(s: str) -> str:
         s = normalize_variant(s)
         s = re.sub(r"\b(disposable|reusable|single-use|virgin|recycled|new|remanufactured)\b", " ", s)
@@ -254,10 +244,13 @@ def variant_swap_candidate(df: pd.DataFrame, product_name: str, current_factor: 
     if not src_base:
         return None
 
+    # Try each swap in order
     for a, b in swaps:
         if re.search(rf"\b{re.escape(a)}\b", src):
+            # Construct target query
             target_query = re.sub(rf"\b{re.escape(a)}\b", b, src).strip()
 
+            # Candidates: exact name match first
             exact = df[df["product_or_process"].str.lower().str.strip() == target_query.lower().strip()]
             if len(exact):
                 row = exact.iloc[0]
@@ -267,18 +260,22 @@ def variant_swap_candidate(df: pd.DataFrame, product_name: str, current_factor: 
                     row["shared_tokens"] = shared_tokens_count(product_name, str(row["product_or_process"]))
                     return row
 
+            # Otherwise: search for same base + contains the greener token
             df2 = df.copy()
             df2["base"] = df2["product_or_process"].apply(base_form)
             df2 = df2[df2["base"] == src_base].copy()
+
             if df2.empty:
                 continue
 
             df2["name_norm2"] = df2["product_or_process"].str.lower().str.strip()
             df2 = df2[df2["name_norm2"].str.contains(rf"\b{re.escape(b)}\b", regex=True)]
             df2 = df2[df2["co2"] < float(current_factor)].copy()
+
             if df2.empty:
                 continue
 
+            # Pick lowest CO2 among those base-matched greener variants
             df2 = df2.sort_values("co2", ascending=True)
             best = df2.iloc[0].copy()
             best["sim"] = 0.99
@@ -287,11 +284,19 @@ def variant_swap_candidate(df: pd.DataFrame, product_name: str, current_factor: 
 
     return None
 
+
 def suggest_alternative(df: pd.DataFrame, product_name: str, current_factor: float):
+    """
+    Two-tier alternative:
+    1) Variant-swap (disposable->reusable etc.) within same base product (very reliable)
+    2) Embedding/TF-IDF similarity fallback with strict thresholds
+    """
+    # Tier 1: variant swap
     alt = variant_swap_candidate(df, product_name, current_factor)
     if alt is not None:
         return alt
 
+    # Tier 2: similarity search (strict)
     if df.empty:
         return None
 
@@ -318,124 +323,24 @@ def suggest_alternative(df: pd.DataFrame, product_name: str, current_factor: flo
     return candidates.iloc[0]
 
 
-# -----------------------------
-# CO2 PREDICTOR (LOCAL)
-# -----------------------------
-class CarbonAttentionModel(nn.Module):
-    def __init__(self, model_name: str):
-        super().__init__()
-        self.encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-        for p in self.encoder.parameters():
-            p.requires_grad = False
-
-        hidden_size = self.encoder.config.hidden_size
-        self.post_encoder_norm = nn.LayerNorm(hidden_size)
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, batch_first=True)
-        self.attn_norm = nn.LayerNorm(hidden_size)
-
-        self.regressor = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 1),
-        )
-
-    def forward(self, ids, mask):
-        with torch.no_grad():
-            outputs = self.encoder(input_ids=ids, attention_mask=mask)
-            lhs = outputs.last_hidden_state
-
-        lhs = self.post_encoder_norm(lhs)
-        attn_out, _ = self.attention(lhs, lhs, lhs)
-        lhs = self.attn_norm(lhs + attn_out)
-        pooled = lhs.mean(dim=1)
-        return self.regressor(pooled)
-
-
-def _load_head_state_dict(path: Path):
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Poids du head introuvables: {path}\n"
-            f"➡️ Assure-toi d'avoir lancé prepare_local_model.py et que best_model.pt existe."
-        )
-
-    sd = torch.load(str(path), map_location="cpu")
-
-    # support: si le fichier contient {"state_dict": ...}
-    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
-        sd = sd["state_dict"]
-
-    # nettoyage des clés potentielles
-    cleaned = {}
-    for k, v in sd.items():
-        kk = k
-        if kk.startswith("model."):
-            kk = kk[len("model."):]
-        cleaned[kk] = v
-
-    return cleaned
-
-
-@st.cache_resource(show_spinner=True)
-def load_carbon_predictor_local():
-    # checks
-    if not LOCAL_ENCODER_DIR.exists():
-        raise FileNotFoundError(f"Encoder local introuvable: {LOCAL_ENCODER_DIR} (lance prepare_local_model.py)")
-    if not LOCAL_TOKENIZER_DIR.exists():
-        raise FileNotFoundError(f"Tokenizer local introuvable: {LOCAL_TOKENIZER_DIR} (lance prepare_local_model.py)")
-    if not LOCAL_HEAD_WEIGHTS.exists():
-        raise FileNotFoundError(f"Poids head introuvables: {LOCAL_HEAD_WEIGHTS} (doit être best_model.pt)")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    tokenizer = AutoTokenizer.from_pretrained(str(LOCAL_TOKENIZER_DIR), trust_remote_code=True)
-    model = CarbonAttentionModel(str(LOCAL_ENCODER_DIR))
-
-    sd = _load_head_state_dict(LOCAL_HEAD_WEIGHTS)
-    model.load_state_dict(sd, strict=False)
-
-    model.to(device)
-    model.eval()
-    return tokenizer, model, device
-
-
-def predict_co2_for_new_product(product_name: str, description: str, unit_str: str):
+def predict_co2_for_new_product(product_name: str, description: str):
     """
-    Le modèle prend en entrée un str = concat des champs Streamlit séparés par '-'
+    Placeholder: branch your model here later.
+    Returns (factor, unit, confidence)
     """
-    tokenizer, model, device = load_carbon_predictor_local()
+    factor = (abs(hash(product_name + "||" + (description or ""))) % 900) / 100.0 + 0.5  # 0.5..9.49
+    unit = "kgCO2e/unité"
+    confidence = 0.35
+    return float(factor), unit, float(confidence)
 
-    text_in = f"{product_name.strip()}-{(description or '').strip()}-{(unit_str or '').strip()}"
-
-    inputs = tokenizer(
-        text_in,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-        padding="max_length",
-    )
-
-    ids = inputs["input_ids"].to(device)
-    mask = inputs["attention_mask"].to(device)
-
-    with torch.no_grad():
-        pred = model(ids, mask).squeeze(-1)
-        factor = float(pred.item())
-
-    factor = max(0.0, factor)
-    confidence = 0.75  # placeholder
-    return factor, (unit_str or "kgCO2e/unité"), confidence
-
-
-def estimate_co2(product_name: str, quantity: float, df: pd.DataFrame, description: str = "", unit_hint: str = "kgCO2e/unité"):
+def estimate_co2(product_name: str, quantity: float, df: pd.DataFrame, description: str = ""):
     exact = df[df["product_or_process"] == product_name]
     if len(exact):
         factor = float(exact.iloc[0]["co2"])
         unit = str(exact.iloc[0]["unit"]).strip() or "kgCO2e/unité"
         return factor * quantity, factor, unit, True, 0.95
 
-    factor, unit, conf = predict_co2_for_new_product(product_name, description, unit_hint)
+    factor, unit, conf = predict_co2_for_new_product(product_name, description)
     return factor * quantity, factor, unit, False, conf
 
 
@@ -459,7 +364,6 @@ with st.sidebar:
         ["🧾 Liste d’achats", "📊 Insights (placeholder)", "⚙️ Paramètres (placeholder)"],
         index=0,
     )
-
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     st.markdown("### 📁 Dataset")
     st.write(f"`{DATA_PATH}`")
@@ -467,11 +371,6 @@ with st.sidebar:
         f'<div class="small">Alternative: sim ≥ <b>{SIM_THRESHOLD}</b>, overlap ≥ <b>{MIN_SHARED_TOKENS}</b></div>',
         unsafe_allow_html=True,
     )
-
-    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-    st.markdown("### 🧠 Modèle CO₂ (local)")
-    st.caption(f"Poids: {LOCAL_HEAD_WEIGHTS}")
-    st.caption(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 
 df = load_data(DATA_PATH)
 
@@ -484,7 +383,7 @@ if page.startswith("🧾"):
     st.markdown(
         '<span class="badge">Ajout par formulaire</span> '
         '<span class="badge">CO₂ par ligne + total</span> '
-        '<span class="badge">Modèle local branché</span>',
+        '<span class="badge">Interface prête pour ton modèle</span>',
         unsafe_allow_html=True
     )
     st.write("")
@@ -496,8 +395,8 @@ if page.startswith("🧾"):
 <div class="card">
   <div style="font-size:1.05rem; font-weight:800;">Principe</div>
   <div class="small">
-    Mode <b>Oui</b> : produit reconnu dans la base → facteur CO₂ du CSV.<br/>
-    Mode <b>Non</b> : produit hors base → facteur CO₂ prédit via le modèle local, sur une entrée concaténée avec <b>-</b>.
+    Mode <b>Oui</b> : sélection dans la base, et l’usage est prérempli correctement selon le produit sélectionné.<br/>
+    Mode <b>Non</b> : saisie libre (aucune liste), et le facteur CO₂ est prêt à être prédit par ton futur modèle.
   </div>
 </div>
 """,
@@ -514,6 +413,9 @@ if page.startswith("🧾"):
                 st.session_state.basket = []
                 st.toast("Liste vidée.")
 
+    # -----------------------------
+    # ADD UI (radio OUTSIDE forms)
+    # -----------------------------
     if st.session_state.add_open:
         st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
         st.subheader("Ajouter un produit")
@@ -525,12 +427,14 @@ if page.startswith("🧾"):
             key="mode_outside_form"
         )
 
-        st.write("")
+        st.write("")  # spacing
 
         if mode == "Oui (sélection)":
+            # ---- KNOWN FORM ----
             if len(df) == 0:
                 st.warning("Dataset vide : passe en saisie libre.")
             else:
+                # Selection outside of the text_area state issue: compute defaults every rerun
                 selected = st.selectbox(
                     "Produit (base existante)",
                     options=df["product_or_process"].tolist(),
@@ -542,6 +446,7 @@ if page.startswith("🧾"):
                 unit_default = str(row["unit"]).strip() or "kgCO2e/unité"
 
                 with st.form("known_form", clear_on_submit=True):
+                    # IMPORTANT: do NOT use a sticky key that prevents value from updating
                     description = st.text_area(
                         "Description / usage (functional unit)",
                         value=desc_default,
@@ -557,10 +462,9 @@ if page.startswith("🧾"):
                     if submitted:
                         unit_user = (unit_user or "").strip() or unit_default
 
-                        total_co2, factor, unit_model, known, conf = estimate_co2(
-                            selected, float(quantity), df, description, unit_user
-                        )
+                        total_co2, factor, unit_model, known, conf = estimate_co2(selected, float(quantity), df, description)
                         unit_final = unit_user if unit_user else unit_model
+
                         alt = suggest_alternative(df, selected, current_factor=float(factor)) if len(df) else None
 
                         st.session_state.basket.append({
@@ -581,6 +485,7 @@ if page.startswith("🧾"):
                         st.rerun()
 
         else:
+            # ---- FREE FORM ----
             with st.form("free_form", clear_on_submit=True):
                 name = st.text_input(
                     "Nom du produit (libellé complet)",
@@ -611,10 +516,9 @@ if page.startswith("🧾"):
                         name = name.strip()
                         unit_user = (unit_user or "").strip() or "kgCO2e/unité"
 
-                        total_co2, factor, unit_model, known, conf = estimate_co2(
-                            name, float(quantity), df, desc, unit_user
-                        )
+                        total_co2, factor, unit_model, known, conf = estimate_co2(name, float(quantity), df, desc)
                         unit_final = unit_user if unit_user else unit_model
+
                         alt = suggest_alternative(df, name, current_factor=float(factor)) if len(df) else None
 
                         st.session_state.basket.append({
@@ -636,6 +540,9 @@ if page.startswith("🧾"):
 
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
+    # -----------------------------
+    # BASKET RENDER
+    # -----------------------------
     if not st.session_state.basket:
         st.markdown(
             """
@@ -730,4 +637,3 @@ else:
     st.info("Ici tu brancheras ton vrai modèle (LLM/ML) pour prédire le facteur CO₂ des produits non présents dans la base.")
     st.write("Dataset chargé :", len(df), "lignes")
     st.write("Embeddings disponibles :", "Oui (SentenceTransformers)" if EMBEDDINGS_AVAILABLE else "Non (fallback TF-IDF)")
-    st.write("Torch device :", "cuda" if torch.cuda.is_available() else "cpu")

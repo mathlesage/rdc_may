@@ -1,11 +1,5 @@
-pathlib
-numpy
-pandas
-streamli
-torch
-torch.nn
-transformers
-huggingface_hub
-rich==14.2.0
-markdown-it-py==4.0.0
-pygments==2.19.2
+streamlit>=1.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+sentence-transformers>=2.2.0

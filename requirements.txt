@@ -1,4 +1,8 @@
 pathlib
 numpy
 pandas
-streamlit
+streamli
+torch
+torch.nn
+transformers
+huggingface_hub
